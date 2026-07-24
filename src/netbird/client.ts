@@ -35,6 +35,27 @@ interface RequestOptions {
 /** Cheap authenticated read used to check whether a token can authenticate. */
 const USERS_PATH = "/api/users";
 
+/**
+ * Upper bound on any single backoff sleep. The backoff runs OUTSIDE the
+ * per-request AbortController/timeout guard, so an allowlisted-but-hostile
+ * upstream could otherwise answer 429/5xx with an enormous `Retry-After`
+ * (e.g. 24h) and hang the call far past NETBIRD_TIMEOUT_MS. Clamping every
+ * honored delay to this cap keeps total call time bounded (<= maxRetries *
+ * MAX_BACKOFF_MS) regardless of what the upstream sends.
+ */
+export const MAX_BACKOFF_MS = 30_000;
+
+/** One fetch attempt's result: either the HTTP response, or the thrown transport error. */
+type FetchOutcome =
+  | { readonly kind: "response"; readonly res: Response }
+  | { readonly kind: "error"; readonly error: unknown };
+
+/** What to do after classifying an attempt's outcome. */
+type RetryDecision<T> =
+  | { readonly action: "retry" }
+  | { readonly action: "return"; readonly value: T }
+  | { readonly action: "throw"; readonly error: NetBirdApiError };
+
 /** Outcome of a token-verification call: valid, rejected, or indeterminate. */
 export type TokenVerification = "ok" | "invalid" | "unknown";
 
@@ -102,75 +123,119 @@ export class NetBirdClient {
     const url = this.buildUrl(path, options.query);
 
     let attempt = 0;
-    // Retry loop: 429 and 5xx are retried with backoff; other errors bubble up.
+    // Retry loop: 429/5xx and transport errors are retried with backoff. Each
+    // iteration's outcome is classified in one place (decideRetry), which owns
+    // the delay/log/sleep and makes the terminal "throw once exhausted"
+    // explicit rather than a fall-through.
     while (true) {
       await this.opts.rateLimiter.acquire();
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.opts.timeoutMs);
-      let res: Response;
-      try {
-        res = await this.fetchImpl(url, {
-          method,
-          headers: {
-            Authorization: `Token ${this.opts.auth.token}`,
-            Accept: "application/json",
-            ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
-          },
-          body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-          signal: controller.signal,
-        });
-      } catch (err) {
-        clearTimeout(timeout);
-        if (attempt < this.maxRetries) {
-          const delay = backoffMs(attempt);
-          this.opts.logger.warn("netbird request failed, retrying", {
-            method,
-            path,
-            attempt,
-            delay,
-          });
-          await sleep(delay);
+      const outcome = await this.fetchOnce(url, method, options);
+      const decision = await this.decideRetry<T>(outcome, attempt, method, path);
+      switch (decision.action) {
+        case "retry":
           attempt++;
           continue;
-        }
-        throw new NetBirdApiError(
-          `Network error calling NetBird ${method} ${path}: ${(err as Error).message}`,
-          0,
-        );
-      } finally {
-        clearTimeout(timeout);
+        case "return":
+          return decision.value;
+        case "throw":
+          throw decision.error;
       }
-
-      if (res.status === 429 || res.status >= 500) {
-        if (attempt < this.maxRetries) {
-          const retryAfter = parseRetryAfter(res.headers.get("retry-after"));
-          const delay = retryAfter ?? backoffMs(attempt);
-          this.opts.logger.warn("netbird throttled/5xx, backing off", {
-            method,
-            path,
-            status: res.status,
-            attempt,
-            delay,
-          });
-          await sleep(delay);
-          attempt++;
-          continue;
-        }
-      }
-
-      const text = await res.text();
-      const parsed = text ? safeJson(text) : undefined;
-
-      if (!res.ok) {
-        throw new NetBirdApiError(
-          `NetBird ${method} ${path} failed with ${res.status}`,
-          res.status,
-          parsed ?? text,
-        );
-      }
-      return parsed as T;
     }
+  }
+
+  /**
+   * Perform exactly one fetch under the request timeout, surfacing the outcome
+   * as data. The AbortController/timeout is always cleared in `finally` (no
+   * duplicate clear on the error path).
+   */
+  private async fetchOnce(
+    url: string,
+    method: string,
+    options: RequestOptions,
+  ): Promise<FetchOutcome> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.opts.timeoutMs);
+    try {
+      const res = await this.fetchImpl(url, {
+        method,
+        headers: {
+          Authorization: `Token ${this.opts.auth.token}`,
+          Accept: "application/json",
+          ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
+        },
+        body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+        signal: controller.signal,
+      });
+      return { kind: "response", res };
+    } catch (err) {
+      return { kind: "error", error: err };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Classify one attempt's outcome into retry | return | throw. Retryable
+   * outcomes (transport error, or 429/5xx) still within the retry budget own
+   * the whole backoff step here — capped-delay computation, logging, and the
+   * sleep — and return "retry". Everything else is terminal and explicit.
+   */
+  private async decideRetry<T>(
+    outcome: FetchOutcome,
+    attempt: number,
+    method: string,
+    path: string,
+  ): Promise<RetryDecision<T>> {
+    const canRetry = attempt < this.maxRetries;
+
+    if (outcome.kind === "error") {
+      if (canRetry) {
+        await this.backoff(backoffMs(attempt), "netbird request failed, retrying", {
+          method,
+          path,
+          attempt,
+        });
+        return { action: "retry" };
+      }
+      const msg = `Network error calling NetBird ${method} ${path}: ${(outcome.error as Error).message}`;
+      return { action: "throw", error: new NetBirdApiError(msg, 0) };
+    }
+
+    const { res } = outcome;
+    if ((res.status === 429 || res.status >= 500) && canRetry) {
+      const retryAfter = parseRetryAfter(res.headers.get("retry-after"));
+      // Clamp the honored delay: never trust an upstream Retry-After beyond the cap.
+      const delay = Math.min(retryAfter ?? backoffMs(attempt), MAX_BACKOFF_MS);
+      await this.backoff(delay, "netbird throttled/5xx, backing off", {
+        method,
+        path,
+        status: res.status,
+        attempt,
+      });
+      return { action: "retry" };
+    }
+
+    const text = await res.text();
+    const parsed = text ? safeJson(text) : undefined;
+    if (!res.ok) {
+      const error = new NetBirdApiError(
+        `NetBird ${method} ${path} failed with ${res.status}`,
+        res.status,
+        parsed ?? text,
+      );
+      return { action: "throw", error };
+    }
+    return { action: "return", value: parsed as T };
+  }
+
+  /** Single place that logs a pending retry and sleeps for the (already capped) delay. */
+  private async backoff(
+    delay: number,
+    message: string,
+    context: Record<string, unknown>,
+  ): Promise<void> {
+    this.opts.logger.warn(message, { ...context, delay });
+    await sleep(delay);
   }
 }
 

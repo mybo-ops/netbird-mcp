@@ -17,7 +17,7 @@ import {
   type OAuthChallenge,
   type OAuthLoginError,
 } from "./core.js";
-import { renderLoginPage, type LoginPageParams } from "./loginPage.js";
+import { renderLoginPage } from "./loginPage.js";
 
 export type ProviderOptions = OAuthCoreOptions;
 
@@ -152,21 +152,19 @@ export class NetBirdOAuthProvider implements OAuthServerProvider {
     this.core.revoke(request.token, client.client_id);
   }
 
-  /** Renders whatever page a login-challenge or login-error decision calls for. */
+  /**
+   * Renders whatever page a login-challenge or login-error decision calls for.
+   * The decision is already structurally a LoginPageParams (its challenge/error
+   * types are `{ kind } & LoginPrefill`, and LoginPrefill = LoginPageParams), so
+   * it is handed straight to the renderer — renderLoginPage reads only the
+   * prefill fields and ignores the discriminant.
+   */
   private sendPage(res: Response, decision: OAuthChallenge | OAuthLoginError): void {
-    const prefill: LoginPageParams = {
-      clientId: decision.clientId,
-      redirectUri: decision.redirectUri,
-      state: decision.state,
-      codeChallenge: decision.codeChallenge,
-      scope: decision.scope,
-      resource: decision.resource,
-    };
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     if (decision.kind === "error") {
-      res.status(400).send(renderLoginPage(prefill, decision.reason));
+      res.status(400).send(renderLoginPage(decision, decision.reason));
       return;
     }
-    res.send(renderLoginPage(prefill));
+    res.send(renderLoginPage(decision));
   }
 }

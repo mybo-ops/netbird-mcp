@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { OAuthCore, type OAuthCoreOptions } from "../src/oauth/core.js";
 import { DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_REQUEST_TIMEOUT_MS } from "../src/config.js";
 import { renderLoginPage, type LoginPageParams } from "../src/oauth/loginPage.js";
-import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { InvalidGrantError, InvalidScopeError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { silentLogger, pkcePair, TEST_ALLOWED_API_HOSTS } from "./helpers.js";
 
@@ -318,6 +318,60 @@ describe("OAuthCore.exchangeAuthorizationCode — PKCE re-verification (defence 
       token: "pat-abc",
       baseUrl: "https://self.hosted",
     });
+  });
+});
+
+describe("OAuthCore.exchangeRefreshToken — scope must not widen (RFC 6749 §6)", () => {
+  async function mintRefreshToken(
+    core: OAuthCore,
+    client: OAuthClientInformationFull,
+    grantedScope: string,
+  ): Promise<string> {
+    const { verifier, challenge } = pkcePair();
+    const decision = await core.completeLogin({
+      clientId: client.client_id,
+      redirectUri: client.redirect_uris[0],
+      codeChallenge: challenge,
+      scope: grantedScope,
+      netbirdToken: "pat-abc",
+      netbirdApiUrl: "https://self.hosted",
+    });
+    const code = new URL((decision as { location: string }).location).searchParams.get("code")!;
+    const tokens = core.exchangeAuthorizationCode(
+      client.client_id,
+      code,
+      verifier,
+      client.redirect_uris[0],
+    );
+    return tokens.refresh_token!;
+  }
+
+  it("rejects a refresh that requests a scope outside the originally granted set", async () => {
+    const core = newCore();
+    const client = registerClient(core);
+    const refreshToken = await mintRefreshToken(core, client, "netbird");
+
+    expect(() =>
+      core.exchangeRefreshToken(client.client_id, refreshToken, ["netbird", "admin"]),
+    ).toThrow(InvalidScopeError);
+  });
+
+  it("preserves the granted scopes when the refresh requests no scope", async () => {
+    const core = newCore();
+    const client = registerClient(core);
+    const refreshToken = await mintRefreshToken(core, client, "netbird read");
+
+    const tokens = core.exchangeRefreshToken(client.client_id, refreshToken);
+    expect(tokens.scope).toBe("netbird read");
+  });
+
+  it("accepts a subset refresh and narrows to exactly the requested subset", async () => {
+    const core = newCore();
+    const client = registerClient(core);
+    const refreshToken = await mintRefreshToken(core, client, "netbird read");
+
+    const tokens = core.exchangeRefreshToken(client.client_id, refreshToken, ["read"]);
+    expect(tokens.scope).toBe("read");
   });
 });
 

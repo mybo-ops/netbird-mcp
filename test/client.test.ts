@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
-import { NetBirdClient, NetBirdApiError } from "../src/netbird/client.js";
+import { NetBirdClient, NetBirdApiError, MAX_BACKOFF_MS } from "../src/netbird/client.js";
 import { RateLimiter } from "../src/netbird/rateLimiter.js";
+import type { Logger } from "../src/logger.js";
 
 const silentLogger = {
   debug: () => {},
@@ -66,6 +67,57 @@ describe("NetBirdClient", () => {
     const result = await client.get("/api/peers");
     expect(result).toEqual({ ok: true });
     expect(calls).toBe(2);
+  });
+
+  it("caps an oversized Retry-After so a hostile upstream can't stall the call", async () => {
+    // A compromised-but-allowlisted upstream could answer 429 with a huge
+    // Retry-After (e.g. 24h) and hang the call far past NETBIRD_TIMEOUT_MS,
+    // since the backoff sleep runs outside the request timeout guard. The cap
+    // must clamp the honored delay to MAX_BACKOFF_MS. Fake timers let us drive
+    // the (clamped) sleep instantly and inspect the delay the client chose.
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const warnDelays: number[] = [];
+      const capturingLogger: Logger = {
+        debug: () => {},
+        info: () => {},
+        warn: (_msg, meta) => {
+          const delay = meta?.delay;
+          if (typeof delay === "number") warnDelays.push(delay);
+        },
+        error: () => {},
+      };
+      const fetchImpl = vi.fn(async () => {
+        calls++;
+        if (calls === 1) {
+          // 86400s == 24h — three-plus orders of magnitude past any sane cap.
+          return new Response("", { status: 429, headers: { "retry-after": "86400" } });
+        }
+        return jsonResponse({ ok: true });
+      }) as unknown as typeof fetch;
+
+      const client = new NetBirdClient({
+        auth: { token: "test-pat", baseUrl: "https://api.netbird.io" },
+        logger: capturingLogger,
+        rateLimiter: new RateLimiter(1000),
+        timeoutMs: 5000,
+        fetchImpl,
+        maxRetries: 4,
+      });
+
+      const pending = client.get("/api/peers");
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(result).toEqual({ ok: true });
+      expect(calls).toBe(2);
+      // The honored delay must be clamped to the cap, not the 86_400_000ms sent.
+      expect(warnDelays[0]).toBe(MAX_BACKOFF_MS);
+      expect(warnDelays[0]).toBeLessThan(86_400_000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("throws NetBirdApiError on 4xx (non-429)", async () => {
