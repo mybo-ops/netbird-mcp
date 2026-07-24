@@ -2,7 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { authFromEnv } from "../auth/fromEnv.js";
 import { AuthError } from "../auth/context.js";
-import { loadServerConfig } from "../config.js";
+import { loadConfigOrExit } from "./loadConfigOrExit.js";
 import { createLogger } from "../logger.js";
 import { buildServer, SERVER_NAME, SERVER_VERSION } from "../server.js";
 
@@ -11,7 +11,7 @@ import { buildServer, SERVER_NAME, SERVER_VERSION } from "../server.js";
  * speaks MCP over stdio. Credentials come from the environment (single tenant).
  */
 async function main(): Promise<void> {
-  const config = loadServerConfig();
+  const config = loadConfigOrExit();
   const logger = createLogger(config.logLevel);
 
   let auth;

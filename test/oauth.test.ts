@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { NetBirdOAuthProvider, type ProviderOptions } from "../src/oauth/provider.js";
 import { DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_REQUEST_TIMEOUT_MS } from "../src/config.js";
+import { REFRESH_TTL_SECONDS } from "../src/oauth/store.js";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { silentLogger, pkcePair } from "./helpers.js";
+import { silentLogger, pkcePair, TEST_ALLOWED_API_HOSTS } from "./helpers.js";
 
 // A real PKCE pair: the exchange re-verifies S256(verifier) === stored challenge.
 const { verifier: VERIFIER, challenge: CHALLENGE } = pkcePair(
@@ -16,13 +17,17 @@ function newProvider(opts: Partial<ProviderOptions> = {}) {
     verifyPatOnLogin: false,
     maxRequestsPerMinute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
     requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    allowedApiHosts: TEST_ALLOWED_API_HOSTS,
     ...opts,
   });
 }
 
-async function registerClient(p: NetBirdOAuthProvider): Promise<OAuthClientInformationFull> {
+async function registerClient(
+  p: NetBirdOAuthProvider,
+  clientId = "client-123",
+): Promise<OAuthClientInformationFull> {
   const client: OAuthClientInformationFull = {
-    client_id: "client-123",
+    client_id: clientId,
     redirect_uris: ["http://localhost:9999/cb"],
   } as OAuthClientInformationFull;
   await p.clientsStore.registerClient!(client);
@@ -144,9 +149,74 @@ describe("NetBirdOAuthProvider", () => {
     );
   });
 
+  it("still exchanges a refresh token within its bounded lifetime", async () => {
+    vi.useFakeTimers();
+    try {
+      const p = newProvider();
+      const client = await registerClient(p);
+      const code = await mintCode(p, client, { netbirdToken: "pat", baseUrl: "https://api.netbird.io" });
+      const tokens = await p.exchangeAuthorizationCode(client, code, VERIFIER, client.redirect_uris[0]);
+
+      // A minute short of the deadline it is still usable.
+      await vi.advanceTimersByTimeAsync(REFRESH_TTL_SECONDS * 1000 - 60_000);
+      const refreshed = await p.exchangeRefreshToken(client, tokens.refresh_token!);
+      expect(refreshed.access_token).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses a refresh token once past its bounded lifetime", async () => {
+    vi.useFakeTimers();
+    try {
+      const p = newProvider();
+      const client = await registerClient(p);
+      const code = await mintCode(p, client, { netbirdToken: "pat", baseUrl: "https://api.netbird.io" });
+      const tokens = await p.exchangeAuthorizationCode(client, code, VERIFIER, client.redirect_uris[0]);
+
+      // Past the bounded lifetime, the refresh grant is refused.
+      await vi.advanceTimersByTimeAsync(REFRESH_TTL_SECONDS * 1000 + 60_000);
+      await expect(p.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+        InvalidGrantError,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects unknown access tokens", async () => {
     const p = newProvider();
     await expect(p.verifyAccessToken("nope")).rejects.toThrow(InvalidTokenError);
+  });
+
+  it("revokes an access token only for the client that owns it (RFC 7009)", async () => {
+    const p = newProvider();
+    const owner = await registerClient(p, "owner");
+    const intruder = await registerClient(p, "intruder");
+    const code = await mintCode(p, owner, { netbirdToken: "pat", baseUrl: "https://api.netbird.io" });
+    const tokens = await p.exchangeAuthorizationCode(owner, code, VERIFIER, owner.redirect_uris[0]);
+
+    // A different client's revoke is a silent no-op — it still succeeds, but the
+    // token is untouched (a client must not be able to kill another's tokens).
+    await expect(p.revokeToken(intruder, { token: tokens.access_token })).resolves.toBeUndefined();
+    expect((await p.verifyAccessToken(tokens.access_token)).clientId).toBe("owner");
+
+    // The owning client's revoke removes it, as before.
+    await p.revokeToken(owner, { token: tokens.access_token });
+    await expect(p.verifyAccessToken(tokens.access_token)).rejects.toThrow(InvalidTokenError);
+  });
+
+  it("does not let a different client revoke another's refresh token", async () => {
+    const p = newProvider();
+    const owner = await registerClient(p, "owner");
+    const intruder = await registerClient(p, "intruder");
+    const code = await mintCode(p, owner, { netbirdToken: "pat", baseUrl: "https://api.netbird.io" });
+    const tokens = await p.exchangeAuthorizationCode(owner, code, VERIFIER, owner.redirect_uris[0]);
+
+    await p.revokeToken(intruder, { token: tokens.refresh_token! }); // no-op for a non-owner
+    // The owner's refresh token still works.
+    const refreshed = await p.exchangeRefreshToken(owner, tokens.refresh_token!);
+    expect(refreshed.access_token).toBeTruthy();
   });
 
   it("tells the SDK to delegate PKCE so the code_verifier reaches the core", async () => {

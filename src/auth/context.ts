@@ -12,7 +12,17 @@ export interface AuthContext {
 }
 
 /** Machine-readable reason for an AuthError, for transports to map uniformly. */
-export type AuthErrorCode = "missing_credentials" | "unknown_token" | "wrong_scheme" | "oauth_disabled";
+export type AuthErrorCode =
+  | "missing_credentials"
+  | "unknown_token"
+  | "wrong_scheme"
+  | "oauth_disabled"
+  /** The direct-PAT header path is turned off (NETBIRD_ENABLE_DIRECT_PAT). */
+  | "direct_pat_disabled"
+  /** The caller-supplied NetBird base URL is not on the host allowlist. */
+  | "forbidden_host"
+  /** The presented direct PAT was rejected by NetBird (401/403). */
+  | "invalid_token";
 
 export class AuthError extends Error {
   readonly code: AuthErrorCode;

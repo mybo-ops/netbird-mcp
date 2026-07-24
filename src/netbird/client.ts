@@ -174,6 +174,19 @@ export class NetBirdClient {
   }
 }
 
+/**
+ * Verify a NetBird PAT by constructing a short-lived client and issuing the
+ * cheap authenticated read. The single wrapper both the OAuth login flow and the
+ * direct-PAT request path use, so the auth-header convention, timeout, retry, and
+ * rate limiting have exactly one implementation. Never throws — see verifyToken.
+ */
+export function verifyPat(
+  auth: AuthContext,
+  deps: { logger: Logger; rateLimiter: RateLimiter; timeoutMs: number; fetchImpl?: typeof fetch },
+): Promise<TokenVerification> {
+  return new NetBirdClient({ auth, ...deps }).verifyToken();
+}
+
 function backoffMs(attempt: number): number {
   // Exponential backoff with jitter: ~0.5s, 1s, 2s, 4s (+/- 20%).
   const base = 500 * 2 ** attempt;

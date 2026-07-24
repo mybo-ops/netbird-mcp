@@ -34,13 +34,16 @@ const baseConfig: ServerConfig = {
   maxRequestsPerMinute: 1000,
   requestTimeoutMs: 5000,
   logLevel: "error",
+  allowedApiHosts: ["api.netbird.io"],
   http: {
     port: 3000,
     tokenHeader: "x-netbird-token",
     urlHeader: "x-netbird-api-url",
     oauthEnabled: false,
+    directPatEnabled: true,
     publicBaseUrl: "http://localhost:3000",
     verifyPatOnLogin: false,
+    trustProxy: false,
   },
 };
 

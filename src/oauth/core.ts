@@ -5,15 +5,32 @@ import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/
 import { normalizeBaseUrl } from "../config.js";
 import type { Logger } from "../logger.js";
 import { AuthContext, AuthError } from "../auth/context.js";
-import { NetBirdClient, type TokenVerification } from "../netbird/client.js";
+import { verifyPat, type TokenVerification } from "../netbird/client.js";
+import { checkApiUrl } from "../netbird/apiUrlPolicy.js";
 import { RateLimiter } from "../netbird/rateLimiter.js";
+import { LimiterPool } from "../netbird/limiterPool.js";
 import { ACCESS_TTL_SECONDS, OAuthStore, type NetBirdBinding } from "./store.js";
 import type { LoginPageParams } from "./loginPage.js";
+
+/**
+ * A single login source may spend at most 1/N of the global verify budget before
+ * its own sub-limiter throttles it — so one noisy source can't drain the shared
+ * budget and stall everyone else's logins.
+ */
+const LOGIN_VERIFY_SOURCE_SHARE = 10;
+/** Source key used when the caller can't attribute a request (e.g. IP unavailable). */
+const UNKNOWN_LOGIN_SOURCE = "unknown";
 
 export interface OAuthCoreOptions {
   logger: Logger;
   /** Verify a NetBird PAT during login by making a cheap read call. */
   verifyPatOnLogin?: boolean;
+  /**
+   * Hosts a submitted netbird_api_url may target — the resolved
+   * config.allowedApiHosts. The login flow checks against this before any
+   * verification fetch, so the form can't be used to reach an internal host.
+   */
+  allowedApiHosts: readonly string[];
   /**
    * Client-side per-minute cap for login-path PAT verification. Required — the
    * operator's resolved config (NETBIRD_MAX_RPM) is threaded down here so the
@@ -80,16 +97,24 @@ export class OAuthCore {
   private readonly verifyPat: boolean;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly allowedApiHosts: readonly string[];
   // Shared across all logins so a burst of login attempts is throttled as one
   // stream, not one fresh (and therefore never-tripping) limiter per attempt.
   private readonly verifyLimiter: RateLimiter;
+  // Per-source sub-limiters (keyed by client IP), each a small slice of the
+  // global budget, so a single source can't monopolize verification. Bounded in
+  // memory by LimiterPool's own eviction, so distinct sources can't grow it.
+  private readonly verifySourceLimiters: LimiterPool;
 
   constructor(opts: OAuthCoreOptions) {
     this.logger = opts.logger;
     this.verifyPat = opts.verifyPatOnLogin ?? true;
     this.timeoutMs = opts.requestTimeoutMs;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.allowedApiHosts = opts.allowedApiHosts;
     this.verifyLimiter = new RateLimiter(opts.maxRequestsPerMinute);
+    const perSourceMax = Math.max(1, Math.floor(opts.maxRequestsPerMinute / LOGIN_VERIFY_SOURCE_SHARE));
+    this.verifySourceLimiters = new LimiterPool(perSourceMax);
   }
 
   // --- dynamic client registration (backs the adapter's clientsStore) ---
@@ -146,7 +171,10 @@ export class OAuthCore {
    * on success binds a one-time authorization code to the credential. Returns a
    * redirect (with the code) or an error to re-render, never throws.
    */
-  async completeLogin(form: LoginSubmission): Promise<CompleteLoginResult> {
+  async completeLogin(
+    form: LoginSubmission,
+    sourceKey: string = UNKNOWN_LOGIN_SOURCE,
+  ): Promise<CompleteLoginResult> {
     const prefill: LoginPrefill = {
       clientId: form.clientId ?? "",
       redirectUri: form.redirectUri ?? "",
@@ -157,10 +185,11 @@ export class OAuthCore {
     };
     const netbirdToken = (form.netbirdToken ?? "").trim();
     const baseUrl = normalizeBaseUrl(form.netbirdApiUrl);
-    if (!isHttpUrl(baseUrl)) {
+    const urlCheck = checkApiUrl(baseUrl, this.allowedApiHosts);
+    if (!urlCheck.allowed) {
       return {
         kind: "error",
-        reason: "The NetBird API URL must be a valid http(s) URL.",
+        reason: `That NetBird API URL is not allowed: ${urlCheck.reason}.`,
         ...prefill,
       };
     }
@@ -185,7 +214,7 @@ export class OAuthCore {
     }
 
     if (this.verifyPat) {
-      const validity = await this.checkPat(netbirdToken, baseUrl);
+      const validity = await this.checkPat(netbirdToken, baseUrl, sourceKey);
       if (validity === "invalid") {
         return {
           kind: "error",
@@ -295,8 +324,9 @@ export class OAuthCore {
     return { token: binding.netbirdToken, baseUrl: binding.baseUrl };
   }
 
-  revoke(token: string): void {
-    this.store.revoke(token);
+  /** Revoke on behalf of the requesting client (RFC 7009); other clients' tokens are left untouched. */
+  revoke(token: string, clientId: string): void {
+    this.store.revokeForClient(token, clientId);
   }
 
   private tokenResponse(accessToken: string, refreshToken: string, scopes: string[]): OAuthTokens {
@@ -314,15 +344,20 @@ export class OAuthCore {
    * header convention, timeout, retry, and rate limiting have exactly one
    * implementation — the same one every tool call uses.
    */
-  private checkPat(pat: string, baseUrl: string): Promise<TokenVerification> {
-    const client = new NetBirdClient({
-      auth: { token: pat, baseUrl },
-      logger: this.logger,
-      rateLimiter: this.verifyLimiter,
-      timeoutMs: this.timeoutMs,
-      fetchImpl: this.fetchImpl,
-    });
-    return client.verifyToken();
+  private async checkPat(pat: string, baseUrl: string, sourceKey: string): Promise<TokenVerification> {
+    // Take the per-source slot first: a source over its share stalls here on its
+    // own limiter without ever consuming a slot in the shared global limiter, so
+    // other sources' verifications still get through.
+    await this.verifySourceLimiters.get(sourceKey).acquire();
+    return verifyPat(
+      { token: pat, baseUrl },
+      {
+        logger: this.logger,
+        rateLimiter: this.verifyLimiter,
+        timeoutMs: this.timeoutMs,
+        fetchImpl: this.fetchImpl,
+      },
+    );
   }
 }
 
@@ -339,14 +374,4 @@ function pkceMatches(codeVerifier: string | undefined, storedChallenge: string):
   const b = Buffer.from(storedChallenge);
   if (a.length !== b.length) return false;
   return timingSafeEqual(a, b);
-}
-
-/** The login form's API URL is untrusted input and becomes a fetch target — accept only http(s). */
-function isHttpUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
 }

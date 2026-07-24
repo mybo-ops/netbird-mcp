@@ -122,6 +122,9 @@ beforeAll(async () => {
       PORT: String(port),
       NETBIRD_ENABLE_OAUTH: "true",
       PUBLIC_BASE_URL: base,
+      // The login form posts netbird_api_url pointing at the fake NetBird on
+      // loopback; allowlist that host so the flow isn't refused as SSRF.
+      NETBIRD_ALLOWED_API_HOSTS: "127.0.0.1",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -185,6 +188,25 @@ describe("OAuth end-to-end over HTTP (spawned server, real MCP client)", () => {
       client_id: clientId,
     });
     expect(replay.status).toBe(400);
+  }, 20_000);
+
+  it("allowlists the login form's netbird_api_url and rate-limits the real login route", async () => {
+    const res = await fetch(`${base}/oauth/netbird-login`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: "c-ssrf",
+        redirect_uri: "http://localhost:9999/cb",
+        code_challenge: "chal",
+        netbird_token: "x",
+        netbird_api_url: "http://169.254.169.254",
+      }),
+    });
+    // A disallowed host is refused (before any outbound call)...
+    expect(res.status).toBe(400);
+    expect(await res.text()).toMatch(/not allowed/i);
+    // ...and the mounted rate limiter tags the response with its standard headers.
+    expect(res.headers.has("ratelimit") || res.headers.has("ratelimit-limit")).toBe(true);
   }, 20_000);
 
   it("rejects a wrong code_verifier at the wire with 400 invalid_grant", async () => {

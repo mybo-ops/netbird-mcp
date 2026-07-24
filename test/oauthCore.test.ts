@@ -4,7 +4,7 @@ import { DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_REQUEST_TIMEOUT_MS } from "../
 import { renderLoginPage, type LoginPageParams } from "../src/oauth/loginPage.js";
 import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { silentLogger, pkcePair } from "./helpers.js";
+import { silentLogger, pkcePair, TEST_ALLOWED_API_HOSTS } from "./helpers.js";
 
 function newCore(opts: Partial<OAuthCoreOptions> = {}): OAuthCore {
   return new OAuthCore({
@@ -12,6 +12,7 @@ function newCore(opts: Partial<OAuthCoreOptions> = {}): OAuthCore {
     verifyPatOnLogin: false,
     maxRequestsPerMinute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
     requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    allowedApiHosts: TEST_ALLOWED_API_HOSTS,
     ...opts,
   });
 }
@@ -35,6 +36,18 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
     headers: { "content-type": "application/json" },
     ...init,
   });
+}
+
+/** A complete, verifiable login form for a client — used by the PAT-verification suites. */
+function patLoginForm(client: OAuthClientInformationFull, netbirdToken: string) {
+  return {
+    clientId: client.client_id,
+    redirectUri: client.redirect_uris[0],
+    codeChallenge: "c1",
+    state: "s1",
+    netbirdToken,
+    netbirdApiUrl: "https://api.netbird.io",
+  };
 }
 
 /** Strip the decision's `kind` (and `reason`, if present) down to renderable fields. */
@@ -377,6 +390,50 @@ describe("OAuthCore.completeLogin — API URL validation and indeterminate verif
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("rejects a NetBird API URL whose host is not on the allowlist, before any fetch", async () => {
+    const fetchSpy = vi.fn();
+    const core = newCore({ verifyPatOnLogin: true, fetchImpl: fetchSpy as unknown as typeof fetch });
+    const client = registerClient(core);
+
+    const decision = await core.completeLogin({
+      ...loginForm(client),
+      netbirdApiUrl: "https://evil.example.com",
+    });
+
+    expect(decision.kind).toBe("error");
+    expect((decision as { reason: string }).reason).toMatch(/allowlist|not allowed/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a metadata-IP NetBird API URL before any fetch (SSRF oracle closed)", async () => {
+    const fetchSpy = vi.fn();
+    const core = newCore({ verifyPatOnLogin: true, fetchImpl: fetchSpy as unknown as typeof fetch });
+    const client = registerClient(core);
+
+    const decision = await core.completeLogin({
+      ...loginForm(client),
+      netbirdApiUrl: "http://169.254.169.254",
+    });
+
+    expect(decision.kind).toBe("error");
+    expect((decision as { reason: string }).reason).toMatch(/private|loopback|link-local|metadata|allowlist/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("lets an allowlisted self-hosted URL proceed to a redirect", async () => {
+    const acceptingFetch = vi.fn(async () => jsonResponse([{ id: "u1" }])) as unknown as typeof fetch;
+    const core = newCore({ verifyPatOnLogin: true, fetchImpl: acceptingFetch });
+    const client = registerClient(core);
+
+    const decision = await core.completeLogin({
+      ...loginForm(client),
+      netbirdApiUrl: "https://self.hosted",
+    });
+
+    expect(decision.kind).toBe("redirect");
+    expect(acceptingFetch).toHaveBeenCalledOnce();
+  });
+
   it("lets login proceed when PAT verification is indeterminate (network failure)", async () => {
     const failingFetch = (() =>
       Promise.reject(new Error("ECONNREFUSED"))) as unknown as typeof fetch;
@@ -398,17 +455,6 @@ describe("OAuthCore.completeLogin — API URL validation and indeterminate verif
 });
 
 describe("OAuthCore — configured rate limit governs login-path PAT verification", () => {
-  function loginForm(client: OAuthClientInformationFull, netbirdToken: string) {
-    return {
-      clientId: client.client_id,
-      redirectUri: client.redirect_uris[0],
-      codeChallenge: "c1",
-      state: "s1",
-      netbirdToken,
-      netbirdApiUrl: "https://api.netbird.io",
-    };
-  }
-
   it("shares a maxRequestsPerMinute=1 limiter across logins, delaying the second verification", async () => {
     const acceptingFetch = vi.fn(async () => jsonResponse([{ id: "u1" }])) as unknown as typeof fetch;
     const core = newCore({
@@ -421,12 +467,12 @@ describe("OAuthCore — configured rate limit governs login-path PAT verificatio
     vi.useFakeTimers();
     try {
       // First login consumes the single slot in the shared verify limiter.
-      const first = await core.completeLogin(loginForm(client, "pat-1"));
+      const first = await core.completeLogin(patLoginForm(client, "pat-1"));
       expect(first.kind).toBe("redirect");
       expect(acceptingFetch).toHaveBeenCalledTimes(1);
 
       // Second login must wait for the sliding window before its PAT check fires.
-      const pending = core.completeLogin(loginForm(client, "pat-2"));
+      const pending = core.completeLogin(patLoginForm(client, "pat-2"));
       await Promise.resolve();
       await Promise.resolve();
       expect(acceptingFetch).toHaveBeenCalledTimes(1);
@@ -436,6 +482,44 @@ describe("OAuthCore — configured rate limit governs login-path PAT verificatio
       const second = await pending;
       expect(second.kind).toBe("redirect");
       expect(acceptingFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("OAuthCore — per-source login rate limiting isolates a noisy source", () => {
+  it("throttles one source on its own sub-limiter while another source still logs in", async () => {
+    const acceptingFetch = vi.fn(async () => jsonResponse([{ id: "u1" }])) as unknown as typeof fetch;
+    // Global budget 20/min -> each source gets floor(20/10)=2 before its own
+    // sub-limiter throttles, so no single source can drain the shared budget.
+    const core = newCore({ verifyPatOnLogin: true, maxRequestsPerMinute: 20, fetchImpl: acceptingFetch });
+    const client = registerClient(core);
+    const noisy = "1.1.1.1";
+    const other = "2.2.2.2";
+
+    vi.useFakeTimers();
+    try {
+      // The noisy source spends its per-source budget (2 verifications).
+      await core.completeLogin(patLoginForm(client, "pat-a1"), noisy);
+      await core.completeLogin(patLoginForm(client, "pat-a2"), noisy);
+      expect(acceptingFetch).toHaveBeenCalledTimes(2);
+
+      // Its 3rd attempt stalls on its OWN sub-limiter (not the shared budget).
+      const stalled = core.completeLogin(patLoginForm(client, "pat-a3"), noisy);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(acceptingFetch).toHaveBeenCalledTimes(2);
+
+      // A different source logs in immediately — the shared budget wasn't exhausted.
+      const otherLogin = await core.completeLogin(patLoginForm(client, "pat-b"), other);
+      expect(otherLogin.kind).toBe("redirect");
+      expect(acceptingFetch).toHaveBeenCalledTimes(3);
+
+      // Once the noisy source's window slides, its stalled attempt drains.
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect((await stalled).kind).toBe("redirect");
+      expect(acceptingFetch).toHaveBeenCalledTimes(4);
     } finally {
       vi.useRealTimers();
     }

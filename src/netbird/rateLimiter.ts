@@ -1,9 +1,12 @@
+/** Sliding-window span. A limiter idle at least this long has let every timestamp age out. */
+export const RATE_LIMITER_WINDOW_MS = 60_000;
+
 /**
  * Sliding-window rate limiter. Keeps outgoing NetBird calls under a per-minute
  * cap so users never have to think about the API's 120 req/min limit.
  */
 export class RateLimiter {
-  private readonly windowMs = 60_000;
+  private readonly windowMs = RATE_LIMITER_WINDOW_MS;
   private readonly timestamps: number[] = [];
 
   constructor(private readonly maxPerWindow: number) {}

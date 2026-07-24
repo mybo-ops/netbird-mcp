@@ -101,13 +101,24 @@ The flow implemented: OAuth 2.0 Protected Resource + Authorization Server metada
 > The prototype keeps OAuth token→PAT bindings **in memory**. For production, back them with a
 > shared, encrypted store (e.g. Redis) so tokens survive restarts and work across replicas.
 
+> Behind a reverse proxy or load balancer, set `NETBIRD_TRUST_PROXY` (see Configuration) so the
+> per-IP rate limits — the OAuth routes, the `/oauth/netbird-login` form, and per-source login
+> PAT verification — key on the real client IP rather than the proxy's. Left unset behind a proxy,
+> every client collapses into one bucket, which throttles everyone instead of isolating abusers.
+
 ### Direct-PAT alternative (testing / simple deploys)
 
 Instead of OAuth you can pass the NetBird PAT directly per request via the `x-netbird-token`
 header (configurable with `NETBIRD_TOKEN_HEADER`) or `Authorization: Token <pat>`. The token is
 used only for the life of the request and never persisted, so one deployment still serves many
-tenants. `Authorization: Bearer` is reserved for OAuth. Disable OAuth entirely with
-`NETBIRD_ENABLE_OAUTH=false`.
+tenants. `Authorization: Bearer` is reserved for OAuth.
+
+This path is **off by default whenever OAuth is enabled** — turn it on explicitly with
+`NETBIRD_ENABLE_DIRECT_PAT=true` (it is on automatically when OAuth is disabled, since it is then
+the only way to authenticate). When it is on, each request's base URL must be on the host
+allowlist — the configured `NETBIRD_API_URL` host plus anything in `NETBIRD_ALLOWED_API_HOSTS` —
+and the presented PAT is verified against NetBird before any tool runs, so the server can't be
+steered at an arbitrary host or driven with an unverified token.
 
 ---
 
@@ -117,6 +128,7 @@ tenants. `Authorization: Bearer` is reserved for OAuth. Disable OAuth entirely w
 |----------|------|---------|---------|
 | `NETBIRD_API_TOKEN` | local | — | NetBird PAT (required for stdio) |
 | `NETBIRD_API_URL` | both | `https://api.netbird.io` | API base URL; set for self-hosted |
+| `NETBIRD_ALLOWED_API_HOSTS` | both | (the `NETBIRD_API_URL` host) | Extra hosts a request-supplied base URL may target, comma-separated |
 | `NETBIRD_ENABLE_DESTRUCTIVE` | both | `false` | Enable `delete_*` tools |
 | `NETBIRD_MAX_RPM` | both | `110` | Client-side rate cap (under NetBird's 120/min) |
 | `NETBIRD_TIMEOUT_MS` | both | `30000` | Per-request timeout |
@@ -124,7 +136,9 @@ tenants. `Authorization: Bearer` is reserved for OAuth. Disable OAuth entirely w
 | `PORT` | cloud | `3000` | HTTP listen port |
 | `PUBLIC_BASE_URL` | cloud | `http://localhost:PORT` | Public HTTPS origin advertised in OAuth metadata |
 | `NETBIRD_ENABLE_OAUTH` | cloud | `true` | Enable the OAuth 2.1 authorization server |
+| `NETBIRD_ENABLE_DIRECT_PAT` | cloud | off when OAuth on | Allow the direct-PAT header path (auto-on when OAuth is off) |
 | `NETBIRD_VERIFY_PAT_ON_LOGIN` | cloud | `true` | Live-check the PAT during OAuth login |
+| `NETBIRD_TRUST_PROXY` | cloud | `false` | Express `trust proxy` for real client IPs behind a proxy: hop count (e.g. `1`), boolean, or preset (`loopback`) |
 | `NETBIRD_TOKEN_HEADER` | cloud | `x-netbird-token` | Header carrying the caller's PAT (direct-PAT mode) |
 | `NETBIRD_URL_HEADER` | cloud | `x-netbird-api-url` | Optional per-tenant base URL header |
 

@@ -33,3 +33,10 @@ export const HEADER_NAMES = {
   tokenHeader: DEFAULT_TOKEN_HEADER,
   urlHeader: DEFAULT_URL_HEADER,
 } as const;
+
+/**
+ * Allowlist threaded into OAuth cores/providers under test. Covers the base-URL
+ * hosts the OAuth suites submit (`api.netbird.io`, the fictitious `self.hosted`),
+ * so login flows proceed; tests that exercise a disallowed host pass their own.
+ */
+export const TEST_ALLOWED_API_HOSTS = ["api.netbird.io", "self.hosted"] as const;
