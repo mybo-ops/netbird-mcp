@@ -43,8 +43,9 @@ export interface HttpConfig {
    * Express `trust proxy` setting. Behind a reverse proxy / load balancer the
    * per-IP rate limits (OAuth routes, the login form, and per-source login
    * verification) must key on the real client IP, not the proxy's — otherwise
-   * every client collapses into one bucket. Set to the number of proxy hops, a
-   * boolean, or a preset (e.g. "loopback"); defaults to false (direct connections).
+   * every client collapses into one bucket. Set to the number of proxy hops or
+   * a preset (e.g. "loopback"); defaults to false (direct connections). Bare
+   * booleans are rejected — trusting every proxy allows IP spoofing.
    */
   trustProxy: boolean | number | string;
 }
@@ -79,16 +80,28 @@ function intEnv(value: string | undefined, fallback: number): number {
 
 /**
  * Parse the Express `trust proxy` value from env. A bare integer is a hop count
- * (the common "one proxy in front" = 1); true/false toggle it; anything else is
- * passed through so operators can use Express presets or subnet lists
- * ("loopback", "10.0.0.0/8", …). Unset means false — safe for direct connections.
+ * (the common "one proxy in front" = 1); anything else is passed through so
+ * operators can use Express presets or subnet lists ("loopback", "10.0.0.0/8", …).
+ * Unset means false — safe for direct connections.
+ *
+ * Permissive booleans (true/yes/on) are rejected: `trust proxy: true` makes
+ * Express trust the client-controlled leftmost X-Forwarded-For entry, letting
+ * anyone spoof their IP past the per-IP rate limits. A hop count or preset is
+ * always the safer way to express the same intent.
  */
 function parseTrustProxy(value: string | undefined): boolean | number | string {
   const v = value?.trim();
   if (!v) return false;
   if (/^\d+$/.test(v)) return Number.parseInt(v, 10);
   const lower = v.toLowerCase();
-  if (["true", "yes", "on"].includes(lower)) return true;
+  if (["true", "yes", "on"].includes(lower)) {
+    throw new Error(
+      `NETBIRD_TRUST_PROXY="${v}" is not allowed: trusting every proxy lets clients ` +
+        `spoof their IP via X-Forwarded-For and bypass per-IP rate limits. ` +
+        `Set the number of proxy hops (e.g. 1) or an Express preset/subnet ` +
+        `(e.g. "loopback", "10.0.0.0/8") instead.`,
+    );
+  }
   if (["false", "no", "off"].includes(lower)) return false;
   return v;
 }

@@ -81,7 +81,7 @@ describe("LimiterPool eviction (memory bound / DoS defense)", () => {
 
     const a = pool.get("a");
     clock.tick();
-    pool.get("b");
+    const b = pool.get("b");
     clock.tick();
     // Touch "a" so "b" is now the least-recently-used of the two.
     pool.get("a");
@@ -91,7 +91,7 @@ describe("LimiterPool eviction (memory bound / DoS defense)", () => {
 
     expect(pool.size).toBe(2);
     expect(pool.get("a")).toBe(a); // survivor keeps its instance
-    expect(pool.get("b")).not.toBe(a); // "b" was reclaimed, re-get is a fresh limiter
+    expect(pool.get("b")).not.toBe(b); // "b" was reclaimed, re-get is a fresh limiter
   });
 
   it("evicts a limiter left idle past the TTL", () => {

@@ -99,9 +99,22 @@ describe("loadServerConfig — http sub-object explicit values", () => {
       loadServerConfig({ NETBIRD_TRUST_PROXY: v } as NodeJS.ProcessEnv).http.trustProxy;
     expect(trust(undefined)).toBe(false);
     expect(trust("1")).toBe(1); // one proxy hop in front
-    expect(trust("true")).toBe(true);
     expect(trust("false")).toBe(false);
+    expect(trust("no")).toBe(false);
+    expect(trust("off")).toBe(false);
     expect(trust("loopback")).toBe("loopback"); // Express preset, passed through
+  });
+
+  it("rejects permissive NETBIRD_TRUST_PROXY booleans at startup", () => {
+    // `trust proxy: true` makes Express trust the client-controlled leftmost
+    // X-Forwarded-For entry, letting anyone spoof their IP past the per-IP rate
+    // limits. Safe alternatives (a hop count or preset) always exist, so a bare
+    // boolean fails fast instead of silently enabling the unsafe mode.
+    for (const v of ["true", "yes", "on", "TRUE"]) {
+      expect(() => loadServerConfig({ NETBIRD_TRUST_PROXY: v } as NodeJS.ProcessEnv)).toThrow(
+        /NETBIRD_TRUST_PROXY/,
+      );
+    }
   });
 
   it("strips a trailing slash from an explicit PUBLIC_BASE_URL", () => {
