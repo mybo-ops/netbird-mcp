@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer, ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ZodRawShapeCompat, ShapeOutput } from "@modelcontextprotocol/sdk/server/zod-compat.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { NetBirdClient } from "../netbird/client.js";
 import { NetBirdApiError } from "../netbird/client.js";
 import type { ServerConfig } from "../config.js";
@@ -158,26 +158,62 @@ function withConfirmField<Args extends DomainShape>(
   return { ...inputSchema, confirm: confirmSchema };
 }
 
+/**
+ * Everything the shared primitive needs to register one tool: the advertised
+ * metadata/schema and a plain handler. The handler returns the tool result
+ * directly — the primitive owns the guard wrap, so handlers stay guard-free.
+ */
+interface RegisterSpec<Args extends ZodRawShapeCompat> {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: Args;
+  annotations: ToolAnnotations;
+  handle: (args: ShapeOutput<Args>) => Promise<CallToolResult>;
+}
+
+/**
+ * The single primitive every public register* function funnels through. It owns
+ * the `guard` wrap (NetBird-error-to-tool-error translation) and the one
+ * boundary cast the SDK's generic callback type forces. Keeping both here means
+ * the public builders below are cast-free config assemblers, and the unsafe
+ * `as unknown as ToolCallback` lives in exactly one place.
+ */
+function register<Args extends ZodRawShapeCompat>(
+  server: McpServer,
+  deps: ToolDeps,
+  spec: RegisterSpec<Args>,
+): void {
+  server.registerTool(
+    spec.name,
+    {
+      title: spec.title,
+      description: spec.description,
+      inputSchema: spec.inputSchema,
+      annotations: spec.annotations,
+    },
+    (async (args: ShapeOutput<Args>) =>
+      guard(deps.logger, () => spec.handle(args))) as unknown as ToolCallback<Args>,
+  );
+}
+
 /** Register a read-only tool: a straight GET, optionally with query params or a response transform. */
 export function registerRead<Args extends ZodRawShapeCompat = Record<string, never>>(
   server: McpServer,
   deps: ToolDeps,
   manifest: ReadManifest<Args>,
 ): void {
-  server.registerTool(
-    manifest.name,
-    {
-      title: manifest.title,
-      description: manifest.description,
-      inputSchema: manifest.inputSchema ?? ({} as Args),
-      annotations: { readOnlyHint: true },
+  register<Args>(server, deps, {
+    name: manifest.name,
+    title: manifest.title,
+    description: manifest.description,
+    inputSchema: manifest.inputSchema ?? ({} as Args),
+    annotations: { readOnlyHint: true },
+    handle: async (args) => {
+      const data = await deps.client.get(manifest.path(args), manifest.query?.(args));
+      return ok(manifest.transformResponse ? manifest.transformResponse(data, args) : data);
     },
-    (async (args: ShapeOutput<Args>) =>
-      guard(deps.logger, async () => {
-        const data = await deps.client.get(manifest.path(args), manifest.query?.(args));
-        return ok(manifest.transformResponse ? manifest.transformResponse(data, args) : data);
-      })) as unknown as ToolCallback<Args>,
-  );
+  });
 }
 
 /**
@@ -190,26 +226,23 @@ export function registerMutation<Args extends DomainShape>(
   deps: ToolDeps,
   manifest: MutationManifest<Args>,
 ): void {
-  server.registerTool(
-    manifest.name,
-    {
-      title: manifest.title,
-      description: manifest.description,
-      inputSchema: withConfirmField(manifest.inputSchema, MUTATION_CONFIRM),
-      annotations: { readOnlyHint: false, destructiveHint: false },
+  register(server, deps, {
+    name: manifest.name,
+    title: manifest.title,
+    description: manifest.description,
+    inputSchema: withConfirmField(manifest.inputSchema, MUTATION_CONFIRM),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+    handle: async (args) => {
+      const body = stripUndefined(manifest.buildBody(args));
+      if (!isConfirmed(args)) return preview(manifest.previewAction(args), body);
+      const path = manifest.path(args);
+      const response =
+        manifest.method === "POST"
+          ? await deps.client.post(path, body)
+          : await deps.client.put(path, body);
+      return ok(response);
     },
-    (async (args: ShapeOutput<Args>) =>
-      guard(deps.logger, async () => {
-        const body = stripUndefined(manifest.buildBody(args));
-        if (!isConfirmed(args)) return preview(manifest.previewAction(args), body);
-        const path = manifest.path(args);
-        const response =
-          manifest.method === "POST"
-            ? await deps.client.post(path, body)
-            : await deps.client.put(path, body);
-        return ok(response);
-      })) as unknown as ToolCallback<Args>,
-  );
+  });
 }
 
 /**
@@ -228,24 +261,21 @@ export function registerDelete<Args extends DomainShape>(
   const inputSchema = withConfirmField(manifest.inputSchema, DELETE_CONFIRM);
   if (!deps.config.enableDestructive) return;
 
-  server.registerTool(
-    manifest.name,
-    {
-      title: manifest.title,
-      description: manifest.description,
-      inputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: true },
+  register(server, deps, {
+    name: manifest.name,
+    title: manifest.title,
+    description: manifest.description,
+    inputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: true },
+    handle: async (args) => {
+      const idValue = (args as Record<string, unknown>)[manifest.idField];
+      if (!isConfirmed(args)) {
+        return preview(`Would DELETE ${manifest.label} ${idValue}.`, {
+          [manifest.idField]: idValue,
+        });
+      }
+      await deps.client.delete(manifest.path(args));
+      return ok({ status: "deleted", [manifest.idField]: idValue });
     },
-    (async (args: ShapeOutput<Args>) =>
-      guard(deps.logger, async () => {
-        const idValue = (args as Record<string, unknown>)[manifest.idField];
-        if (!isConfirmed(args)) {
-          return preview(`Would DELETE ${manifest.label} ${idValue}.`, {
-            [manifest.idField]: idValue,
-          });
-        }
-        await deps.client.delete(manifest.path(args));
-        return ok({ status: "deleted", [manifest.idField]: idValue });
-      })) as unknown as ToolCallback<Args>,
-  );
+  });
 }
