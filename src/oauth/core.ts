@@ -8,8 +8,18 @@ import { AuthContext, AuthError } from "../auth/context.js";
 import { verifyPat, type TokenVerification } from "../netbird/client.js";
 import { checkApiUrl } from "../netbird/apiUrlPolicy.js";
 import { RateLimiter } from "../netbird/rateLimiter.js";
+import { LimiterPool } from "../netbird/limiterPool.js";
 import { ACCESS_TTL_SECONDS, OAuthStore, type NetBirdBinding } from "./store.js";
 import type { LoginPageParams } from "./loginPage.js";
+
+/**
+ * A single login source may spend at most 1/N of the global verify budget before
+ * its own sub-limiter throttles it — so one noisy source can't drain the shared
+ * budget and stall everyone else's logins.
+ */
+const LOGIN_VERIFY_SOURCE_SHARE = 10;
+/** Source key used when the caller can't attribute a request (e.g. IP unavailable). */
+const UNKNOWN_LOGIN_SOURCE = "unknown";
 
 export interface OAuthCoreOptions {
   logger: Logger;
@@ -91,6 +101,10 @@ export class OAuthCore {
   // Shared across all logins so a burst of login attempts is throttled as one
   // stream, not one fresh (and therefore never-tripping) limiter per attempt.
   private readonly verifyLimiter: RateLimiter;
+  // Per-source sub-limiters (keyed by client IP), each a small slice of the
+  // global budget, so a single source can't monopolize verification. Bounded in
+  // memory by LimiterPool's own eviction, so distinct sources can't grow it.
+  private readonly verifySourceLimiters: LimiterPool;
 
   constructor(opts: OAuthCoreOptions) {
     this.logger = opts.logger;
@@ -99,6 +113,8 @@ export class OAuthCore {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.allowedApiHosts = opts.allowedApiHosts;
     this.verifyLimiter = new RateLimiter(opts.maxRequestsPerMinute);
+    const perSourceMax = Math.max(1, Math.floor(opts.maxRequestsPerMinute / LOGIN_VERIFY_SOURCE_SHARE));
+    this.verifySourceLimiters = new LimiterPool(perSourceMax);
   }
 
   // --- dynamic client registration (backs the adapter's clientsStore) ---
@@ -155,7 +171,10 @@ export class OAuthCore {
    * on success binds a one-time authorization code to the credential. Returns a
    * redirect (with the code) or an error to re-render, never throws.
    */
-  async completeLogin(form: LoginSubmission): Promise<CompleteLoginResult> {
+  async completeLogin(
+    form: LoginSubmission,
+    sourceKey: string = UNKNOWN_LOGIN_SOURCE,
+  ): Promise<CompleteLoginResult> {
     const prefill: LoginPrefill = {
       clientId: form.clientId ?? "",
       redirectUri: form.redirectUri ?? "",
@@ -195,7 +214,7 @@ export class OAuthCore {
     }
 
     if (this.verifyPat) {
-      const validity = await this.checkPat(netbirdToken, baseUrl);
+      const validity = await this.checkPat(netbirdToken, baseUrl, sourceKey);
       if (validity === "invalid") {
         return {
           kind: "error",
@@ -305,8 +324,9 @@ export class OAuthCore {
     return { token: binding.netbirdToken, baseUrl: binding.baseUrl };
   }
 
-  revoke(token: string): void {
-    this.store.revoke(token);
+  /** Revoke on behalf of the requesting client (RFC 7009); other clients' tokens are left untouched. */
+  revoke(token: string, clientId: string): void {
+    this.store.revokeForClient(token, clientId);
   }
 
   private tokenResponse(accessToken: string, refreshToken: string, scopes: string[]): OAuthTokens {
@@ -324,7 +344,11 @@ export class OAuthCore {
    * header convention, timeout, retry, and rate limiting have exactly one
    * implementation — the same one every tool call uses.
    */
-  private checkPat(pat: string, baseUrl: string): Promise<TokenVerification> {
+  private async checkPat(pat: string, baseUrl: string, sourceKey: string): Promise<TokenVerification> {
+    // Take the per-source slot first: a source over its share stalls here on its
+    // own limiter without ever consuming a slot in the shared global limiter, so
+    // other sources' verifications still get through.
+    await this.verifySourceLimiters.get(sourceKey).acquire();
     return verifyPat(
       { token: pat, baseUrl },
       {

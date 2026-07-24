@@ -56,6 +56,7 @@ describe("loadServerConfig — http sub-object defaults", () => {
       directPatEnabled: false,
       publicBaseUrl: "http://localhost:3000",
       verifyPatOnLogin: true,
+      trustProxy: false,
     });
   });
 
@@ -84,12 +85,23 @@ describe("loadServerConfig — http sub-object explicit values", () => {
       directPatEnabled: true,
       publicBaseUrl: "https://mcp.example.com",
       verifyPatOnLogin: false,
+      trustProxy: false,
     });
   });
 
   it("parses PORT as a number", () => {
     const config = loadServerConfig({ PORT: "9090" } as NodeJS.ProcessEnv);
     expect(config.http.port).toBe(9090);
+  });
+
+  it("parses NETBIRD_TRUST_PROXY: unset -> false, integer -> hop count, preset -> passthrough", () => {
+    const trust = (v?: string) =>
+      loadServerConfig({ NETBIRD_TRUST_PROXY: v } as NodeJS.ProcessEnv).http.trustProxy;
+    expect(trust(undefined)).toBe(false);
+    expect(trust("1")).toBe(1); // one proxy hop in front
+    expect(trust("true")).toBe(true);
+    expect(trust("false")).toBe(false);
+    expect(trust("loopback")).toBe("loopback"); // Express preset, passed through
   });
 
   it("strips a trailing slash from an explicit PUBLIC_BASE_URL", () => {

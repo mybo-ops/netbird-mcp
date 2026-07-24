@@ -43,6 +43,7 @@ const baseConfig: ServerConfig = {
     directPatEnabled: true,
     publicBaseUrl: "http://localhost:3000",
     verifyPatOnLogin: false,
+    trustProxy: false,
   },
 };
 

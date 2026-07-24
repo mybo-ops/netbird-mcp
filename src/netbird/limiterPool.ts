@@ -2,15 +2,14 @@ import { createHash } from "node:crypto";
 import { RateLimiter, RATE_LIMITER_WINDOW_MS } from "./rateLimiter.js";
 
 /**
- * Per-tenant pool of {@link RateLimiter}s for the multi-tenant HTTP deployment.
+ * Pool of {@link RateLimiter}s keyed by an opaque caller-supplied identifier, so
+ * distinct callers get isolated budgets. Two uses today: per-tenant limiting for
+ * tool calls (keyed by a NetBird token, so one account can't spend another's
+ * slice of NetBird's per-account budget) and per-source limiting for OAuth login
+ * verification (keyed by client IP, so one source can't monopolize it).
  *
- * Callers hand it a tenant's NetBird token and get back that tenant's limiter;
- * the same token always maps to the same limiter, and distinct tokens get
- * isolated budgets so one account can't spend another's slice of NetBird's
- * per-account request budget.
- *
- * The token is never retained as a key — it's reduced to a truncated SHA-256
- * digest before it touches the map, so the raw secret never lives in the pool.
+ * The key is never retained verbatim — it's reduced to a truncated SHA-256 digest
+ * before it touches the map, so a raw secret (or client IP) never lives in the pool.
  *
  * Entries are bounded two ways so an anonymous caller can't grow the pool
  * without limit (a memory-exhaustion DoS — rotate the token value every request
@@ -33,7 +32,7 @@ import { RateLimiter, RATE_LIMITER_WINDOW_MS } from "./rateLimiter.js";
  * head — both eviction paths read from there.
  */
 
-/** Hex digits of the SHA-256 digest kept as the map key — 64 bits, plenty to avoid collisions across tenants. */
+/** Hex digits of the SHA-256 digest kept as the map key — 64 bits, plenty to avoid collisions across callers. */
 const KEY_HEX_CHARS = 16;
 /** Default hard cap on retained limiters. Each limiter is tiny; this bounds worst-case memory. */
 const DEFAULT_MAX_ENTRIES = 10_000;
@@ -99,9 +98,9 @@ export class LimiterPool {
     return this.limiters.size;
   }
 
-  /** Returns the rate limiter for a tenant, creating it on first use. */
-  get(token: string): RateLimiter {
-    const key = createHash("sha256").update(token).digest("hex").slice(0, KEY_HEX_CHARS);
+  /** Returns the rate limiter for a caller key, creating it on first use. */
+  get(callerKey: string): RateLimiter {
+    const key = createHash("sha256").update(callerKey).digest("hex").slice(0, KEY_HEX_CHARS);
     const nowMs = this.now();
     this.reclaimIdle(nowMs);
 

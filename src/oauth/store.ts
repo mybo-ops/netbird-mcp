@@ -31,13 +31,32 @@ interface AccessRecord extends NetBirdBinding {
 interface RefreshRecord extends NetBirdBinding {
   clientId: string;
   scopes: string[];
+  expiresAt: number;
 }
 
 const CODE_TTL_MS = 5 * 60_000; // authorization codes are short-lived
 export const ACCESS_TTL_SECONDS = 60 * 60; // 1 hour
+// Refresh tokens outlive access tokens but not forever: OAuth 2.1 wants a bounded
+// lifetime so a leaked, never-rotated refresh token can't mint access tokens
+// indefinitely. Rotation (see exchangeRefreshToken) resets this window per issue.
+export const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 function token(prefix: string): string {
   return `${prefix}_${randomBytes(32).toString("base64url")}`;
+}
+
+/** Look up a record, dropping (and reporting absent) one that has passed its expiry. */
+function getLive<T extends { expiresAt: number }>(
+  map: Map<string, T>,
+  key: string,
+): T | undefined {
+  const rec = map.get(key);
+  if (!rec) return undefined;
+  if (rec.expiresAt < Date.now()) {
+    map.delete(key);
+    return undefined;
+  }
+  return rec;
 }
 
 export class OAuthStore {
@@ -80,26 +99,42 @@ export class OAuthStore {
       scopes,
       expiresAt: Date.now() + ACCESS_TTL_SECONDS * 1000,
     });
-    this.refresh.set(refreshToken, { ...binding, clientId, scopes });
+    this.refresh.set(refreshToken, {
+      ...binding,
+      clientId,
+      scopes,
+      expiresAt: Date.now() + REFRESH_TTL_SECONDS * 1000,
+    });
     return { accessToken, refreshToken };
   }
 
   getAccess(accessToken: string): AccessRecord | undefined {
-    const rec = this.access.get(accessToken);
-    if (!rec) return undefined;
-    if (rec.expiresAt < Date.now()) {
-      this.access.delete(accessToken);
-      return undefined;
-    }
-    return rec;
+    return getLive(this.access, accessToken);
   }
 
   getRefresh(refreshToken: string): RefreshRecord | undefined {
-    return this.refresh.get(refreshToken);
+    return getLive(this.refresh, refreshToken);
   }
 
+  /** Unconditional delete — used internally for refresh-token rotation. */
   revoke(token: string): void {
     this.access.delete(token);
     this.refresh.delete(token);
+  }
+
+  /**
+   * Revoke a token on behalf of a specific client (RFC 7009): delete it only if
+   * it belongs to that client. A token owned by another client — or one that
+   * doesn't exist — is left untouched; the caller still reports success, so a
+   * client can neither kill another's tokens nor probe which tokens exist.
+   */
+  revokeForClient(token: string, clientId: string): void {
+    const accessRec = this.access.get(token);
+    if (accessRec) {
+      if (accessRec.clientId === clientId) this.access.delete(token);
+      return;
+    }
+    const refreshRec = this.refresh.get(token);
+    if (refreshRec && refreshRec.clientId === clientId) this.refresh.delete(token);
   }
 }

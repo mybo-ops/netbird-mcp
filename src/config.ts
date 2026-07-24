@@ -39,6 +39,14 @@ export interface HttpConfig {
   publicBaseUrl: string;
   /** Whether a PAT is verified against NetBird at OAuth login time. */
   verifyPatOnLogin: boolean;
+  /**
+   * Express `trust proxy` setting. Behind a reverse proxy / load balancer the
+   * per-IP rate limits (OAuth routes, the login form, and per-source login
+   * verification) must key on the real client IP, not the proxy's — otherwise
+   * every client collapses into one bucket. Set to the number of proxy hops, a
+   * boolean, or a preset (e.g. "loopback"); defaults to false (direct connections).
+   */
+  trustProxy: boolean | number | string;
 }
 
 export interface ServerConfig {
@@ -67,6 +75,22 @@ function boolEnv(value: string | undefined, fallback = false): boolean {
 function intEnv(value: string | undefined, fallback: number): number {
   const n = value ? Number.parseInt(value, 10) : NaN;
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Parse the Express `trust proxy` value from env. A bare integer is a hop count
+ * (the common "one proxy in front" = 1); true/false toggle it; anything else is
+ * passed through so operators can use Express presets or subnet lists
+ * ("loopback", "10.0.0.0/8", …). Unset means false — safe for direct connections.
+ */
+function parseTrustProxy(value: string | undefined): boolean | number | string {
+  const v = value?.trim();
+  if (!v) return false;
+  if (/^\d+$/.test(v)) return Number.parseInt(v, 10);
+  const lower = v.toLowerCase();
+  if (["true", "yes", "on"].includes(lower)) return true;
+  if (["false", "no", "off"].includes(lower)) return false;
+  return v;
 }
 
 /**
@@ -130,6 +154,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
       directPatEnabled,
       publicBaseUrl,
       verifyPatOnLogin: boolEnv(env.NETBIRD_VERIFY_PAT_ON_LOGIN, true),
+      trustProxy: parseTrustProxy(env.NETBIRD_TRUST_PROXY),
     },
   };
 }

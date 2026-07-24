@@ -27,7 +27,7 @@ import { loginRateLimiter } from "../oauth/loginRateLimit.js";
  */
 const config = loadConfigOrExit();
 const logger = createLogger(config.logLevel);
-const { port, tokenHeader, urlHeader, oauthEnabled, directPatEnabled, publicBaseUrl, verifyPatOnLogin } =
+const { port, tokenHeader, urlHeader, oauthEnabled, directPatEnabled, publicBaseUrl, verifyPatOnLogin, trustProxy } =
   config.http;
 
 const provider = new NetBirdOAuthProvider({
@@ -71,6 +71,9 @@ const verifyDirectPat = async (auth: AuthContext): Promise<TokenVerification> =>
 };
 
 const app = express();
+// Behind a proxy this must be set so req.ip is the real client IP, which every
+// per-IP rate limiter (OAuth routes, login form, per-source login verify) keys on.
+app.set("trust proxy", trustProxy);
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false })); // OAuth login form posts
 

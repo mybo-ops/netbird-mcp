@@ -83,16 +83,21 @@ export class NetBirdOAuthProvider implements OAuthServerProvider {
    */
   handleLogin = async (req: Request, res: Response): Promise<void> => {
     const body = req.body as Record<string, string>;
-    const decision = await this.core.completeLogin({
-      clientId: body.client_id,
-      redirectUri: body.redirect_uri,
-      state: body.state,
-      codeChallenge: body.code_challenge,
-      scope: body.scope,
-      resource: body.resource,
-      netbirdToken: body.netbird_token,
-      netbirdApiUrl: body.netbird_api_url,
-    });
+    // Key per-source verify throttling on the client IP (honours Express
+    // `trust proxy`); fall through to the core's own default when it's absent.
+    const decision = await this.core.completeLogin(
+      {
+        clientId: body.client_id,
+        redirectUri: body.redirect_uri,
+        state: body.state,
+        codeChallenge: body.code_challenge,
+        scope: body.scope,
+        resource: body.resource,
+        netbirdToken: body.netbird_token,
+        netbirdApiUrl: body.netbird_api_url,
+      },
+      req.ip,
+    );
     if (decision.kind === "redirect") {
       res.redirect(302, decision.location);
       return;
@@ -139,10 +144,12 @@ export class NetBirdOAuthProvider implements OAuthServerProvider {
   }
 
   async revokeToken(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     request: { token: string },
   ): Promise<void> {
-    this.core.revoke(request.token);
+    // RFC 7009: a client may only revoke its own tokens. The core no-ops (still
+    // reporting success) when the token belongs to a different client.
+    this.core.revoke(request.token, client.client_id);
   }
 
   /** Renders whatever page a login-challenge or login-error decision calls for. */

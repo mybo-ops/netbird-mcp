@@ -101,9 +101,10 @@ The flow implemented: OAuth 2.0 Protected Resource + Authorization Server metada
 > The prototype keeps OAuth token→PAT bindings **in memory**. For production, back them with a
 > shared, encrypted store (e.g. Redis) so tokens survive restarts and work across replicas.
 
-> Behind a reverse proxy or load balancer, set Express `trust proxy` appropriately so the
-> per-IP rate limits (on the OAuth routes and the `/oauth/netbird-login` form) key on the real
-> client IP rather than the proxy's — otherwise all clients share one bucket.
+> Behind a reverse proxy or load balancer, set `NETBIRD_TRUST_PROXY` (see Configuration) so the
+> per-IP rate limits — the OAuth routes, the `/oauth/netbird-login` form, and per-source login
+> PAT verification — key on the real client IP rather than the proxy's. Left unset behind a proxy,
+> every client collapses into one bucket, which throttles everyone instead of isolating abusers.
 
 ### Direct-PAT alternative (testing / simple deploys)
 
@@ -137,6 +138,7 @@ steered at an arbitrary host or driven with an unverified token.
 | `NETBIRD_ENABLE_OAUTH` | cloud | `true` | Enable the OAuth 2.1 authorization server |
 | `NETBIRD_ENABLE_DIRECT_PAT` | cloud | off when OAuth on | Allow the direct-PAT header path (auto-on when OAuth is off) |
 | `NETBIRD_VERIFY_PAT_ON_LOGIN` | cloud | `true` | Live-check the PAT during OAuth login |
+| `NETBIRD_TRUST_PROXY` | cloud | `false` | Express `trust proxy` for real client IPs behind a proxy: hop count (e.g. `1`), boolean, or preset (`loopback`) |
 | `NETBIRD_TOKEN_HEADER` | cloud | `x-netbird-token` | Header carrying the caller's PAT (direct-PAT mode) |
 | `NETBIRD_URL_HEADER` | cloud | `x-netbird-api-url` | Optional per-tenant base URL header |
 
