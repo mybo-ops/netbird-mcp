@@ -138,7 +138,7 @@ steered at an arbitrary host or driven with an unverified token.
 | `NETBIRD_ENABLE_OAUTH` | cloud | `true` | Enable the OAuth 2.1 authorization server |
 | `NETBIRD_ENABLE_DIRECT_PAT` | cloud | off when OAuth on | Allow the direct-PAT header path (auto-on when OAuth is off) |
 | `NETBIRD_VERIFY_PAT_ON_LOGIN` | cloud | `true` | Live-check the PAT during OAuth login |
-| `NETBIRD_TRUST_PROXY` | cloud | `false` | Express `trust proxy` for real client IPs behind a proxy: hop count (e.g. `1`), boolean, or preset (`loopback`) |
+| `NETBIRD_TRUST_PROXY` | cloud | `false` | Express `trust proxy` for real client IPs behind a proxy: hop count (e.g. `1`) or preset (`loopback`). Bare booleans are rejected — trusting every proxy allows IP spoofing |
 | `NETBIRD_TOKEN_HEADER` | cloud | `x-netbird-token` | Header carrying the caller's PAT (direct-PAT mode) |
 | `NETBIRD_URL_HEADER` | cloud | `x-netbird-api-url` | Optional per-tenant base URL header |
 
