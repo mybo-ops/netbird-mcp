@@ -1,7 +1,11 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { OAuthClientInformationFull, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import {
+  InvalidGrantError,
+  InvalidScopeError,
+  InvalidTokenError,
+} from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { normalizeBaseUrl } from "../config.js";
 import type { Logger } from "../logger.js";
 import { AuthContext, AuthError } from "../auth/context.js";
@@ -282,7 +286,7 @@ export class OAuthCore {
     if (!rec || rec.clientId !== clientId) {
       throw new InvalidGrantError("unknown refresh token");
     }
-    const grantedScopes = scopes && scopes.length ? scopes : rec.scopes;
+    const grantedScopes = narrowRefreshScopes(scopes, rec.scopes);
     const { accessToken, refreshToken: newRefresh } = this.store.issueTokens(
       { netbirdToken: rec.netbirdToken, baseUrl: rec.baseUrl },
       clientId,
@@ -359,6 +363,23 @@ export class OAuthCore {
       },
     );
   }
+}
+
+/**
+ * RFC 6749 §6: a refresh request may narrow scope but MUST NOT widen it. An
+ * omitted or empty requested set is treated as the full originally granted set;
+ * any requested scope outside `granted` is a widening attempt and is rejected
+ * with invalid_scope rather than silently honoured.
+ */
+function narrowRefreshScopes(requested: string[] | undefined, granted: string[]): string[] {
+  if (!requested || requested.length === 0) return granted;
+  const widened = requested.filter((scope) => !granted.includes(scope));
+  if (widened.length) {
+    throw new InvalidScopeError(
+      `refresh cannot widen scope; not originally granted: ${widened.join(" ")}`,
+    );
+  }
+  return requested;
 }
 
 /**
