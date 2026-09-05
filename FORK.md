@@ -12,9 +12,9 @@ The `Sync upstream and publish GHCR` workflow:
 - merges `netbirdio/netbird-mcp:main` into this fork without force-pushing;
 - runs dependency installation, type-checking, and the upstream test suite;
 - publishes only after those checks pass;
-- publishes `latest`, `main`, and immutable `sha-<12-character-commit>` tags for `linux/amd64` and `linux/arm64`.
+- publishes `latest`, `main`, and immutable `sha-<full-commit>` tags for `linux/amd64` and `linux/arm64`.
 
-A merge conflict or failed test blocks publication and leaves the last known-good image in place.
+A merge conflict, upstream workflow change, or failed test blocks publication and leaves the last known-good image in place. Upstream workflow changes require manual review because importing them automatically would allow new automation to run with this fork's credentials.
 
 ## Runtime configuration
 
